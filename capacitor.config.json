@@ -1,0 +1,5 @@
+{
+  "appId": "com.myapp.vault",
+  "appName": "Vault",
+  "webDir": "dist"
+}
