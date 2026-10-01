@@ -191,17 +191,6 @@ function phoneFromToken(token: string): string {
 }
 
 export default function App() {
-  // Inject Google AdSense script once on mount
-  useEffect(() => {
-    if (document.querySelector('script[data-ad-client="ca-pub-9244785945414753"]')) return;
-    const s = document.createElement("script");
-    s.src = "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-9244785945414753";
-    s.async = true;
-    s.crossOrigin = "anonymous";
-    s.setAttribute("data-ad-client", "ca-pub-9244785945414753");
-    document.head.appendChild(s);
-  }, []);
-
   const [splashDone, setSplashDone] = useState(false);
   // Show onboarding only on first ever launch — never again after that
   const [onboardingDone, setOnboardingDone] = useState(() => !!localStorage.getItem("vault_onboarding_done"));
