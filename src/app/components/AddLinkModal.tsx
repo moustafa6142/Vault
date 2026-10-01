@@ -24,10 +24,6 @@ const T = {
     header: "Add to Vault",
     urlLabel: "Paste Your Link",
     urlPlaceholder: "https://..",
-    autoPaste: "Auto Paste",
-    pasted: "Pasted ✓",
-    pasteFailed: "Failed",
-    pasteHint: "Long-press the field above and tap Paste",
     titleLabel: "Custom Title",
     titlePlaceholder: "Title here...",
     noteLabel: "Add Note",
@@ -46,10 +42,6 @@ const T = {
     header: "أضف إلى Vault",
     urlLabel: "الصق رابطك",
     urlPlaceholder: "https://..",
-    autoPaste: "لصق تلقائي",
-    pasted: "تم ✓",
-    pasteFailed: "فشل",
-    pasteHint: "اضغط مطولاً على الحقل أعلاه واختر «لصق»",
     titleLabel: "عنوان مخصص",
     titlePlaceholder: "العنوان هنا...",
     noteLabel: "إضافة ملاحظة",
@@ -120,29 +112,106 @@ function LinkPreviewCard({ preview, url }: { preview: LinkPreview; url: string }
   );
 }
 
-// Multi-fallback clipboard reader — tries standard API then execCommand
-async function readClipboard(): Promise<string> {
-  // 1. Standard Clipboard API (browser / PWA with permission)
-  if (navigator.clipboard?.readText) {
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) return text;
-    } catch { /* permission denied or not supported */ }
-  }
+const PROXIES = [
+  (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+];
 
-  // 2. execCommand fallback (some Android WebViews)
+function withTimeout(ms: number): AbortSignal {
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+
+function getYouTubeId(u: string): string | null {
   try {
-    const el = document.createElement("textarea");
-    el.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
-    document.body.appendChild(el);
-    el.focus();
-    const ok = document.execCommand("paste");
-    const text = el.value;
-    document.body.removeChild(el);
-    if (ok && text) return text;
-  } catch { /* not supported */ }
+    const x = new URL(u);
+    const host = x.hostname.replace(/^(www\.|m\.|music\.)/, "");
+    if (host === "youtu.be") return x.pathname.slice(1).split("/")[0] || null;
+    if (host === "youtube.com" || host === "youtube-nocookie.com") {
+      if (x.pathname === "/watch") return x.searchParams.get("v");
+      const m = x.pathname.match(/^\/(shorts|embed|live|v)\/([\w-]{6,})/);
+      if (m) return m[2];
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
-  return "";
+function faviconFor(u: string): string {
+  return `https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(u)}`;
+}
+
+function abs(base: string, v?: string | null): string | undefined {
+  if (!v) return undefined;
+  try { return new URL(v, base).toString(); } catch { return undefined; }
+}
+
+async function viaMicrolink(u: string): Promise<LinkPreview | null> {
+  const res = await fetch(`https://api.microlink.io?url=${encodeURIComponent(u)}`, { signal: withTimeout(8000) });
+  const data = await res.json();
+  if (data.status !== "success") return null;
+  return {
+    title: data.data.title ?? undefined,
+    description: data.data.description ?? undefined,
+    image: data.data.image?.url ?? undefined,
+    logo: data.data.logo?.url ?? undefined,
+  };
+}
+
+async function viaOEmbed(u: string): Promise<LinkPreview | null> {
+  const res = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(u)}`, { signal: withTimeout(6000) });
+  const d = await res.json();
+  if (!d || d.error) return null;
+  return { title: d.title, description: d.author_name ? d.author_name : undefined, image: d.thumbnail_url };
+}
+
+async function viaHtml(u: string): Promise<LinkPreview | null> {
+  for (const mk of PROXIES) {
+    try {
+      const res = await fetch(mk(u), { signal: withTimeout(7000) });
+      if (!res.ok) continue;
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const meta = (k: string) =>
+        doc.querySelector(`meta[property="${k}"], meta[name="${k}"]`)?.getAttribute("content") || undefined;
+      const title = meta("og:title") || meta("twitter:title") || doc.title || undefined;
+      const image = abs(u, meta("og:image") || meta("twitter:image") || meta("twitter:image:src"));
+      const icon = abs(u, doc.querySelector('link[rel~="icon"]')?.getAttribute("href"));
+      if (title || image) {
+        return { title, description: meta("og:description") || meta("description"), image, logo: icon };
+      }
+    } catch { /* try next proxy */ }
+  }
+  return null;
+}
+
+async function fetchPreview(u: string): Promise<LinkPreview> {
+  const yt = getYouTubeId(u);
+  const base: LinkPreview = { logo: faviconFor(u) };
+  if (yt) base.image = `https://i.ytimg.com/vi/${yt}/hqdefault.jpg`;
+
+  const attempts: Array<() => Promise<LinkPreview | null>> = yt
+    ? [() => viaOEmbed(u), () => viaMicrolink(u), () => viaHtml(u)]
+    : [() => viaMicrolink(u), () => viaHtml(u), () => viaOEmbed(u)];
+
+  let merged: LinkPreview = { ...base };
+  for (const run of attempts) {
+    try {
+      const r = await run();
+      if (r) {
+        merged = {
+          title: r.title || merged.title,
+          description: r.description || merged.description,
+          image: r.image || merged.image,
+          logo: r.logo || merged.logo,
+        };
+        if (merged.title && merged.image) break;
+      }
+    } catch { /* next provider */ }
+  }
+  if (!merged.title) merged.title = getDomain(u);
+  return merged;
 }
 
 export function AddLinkModal({ onClose, onSave, collections, onAddCollection, lang = "en" }: AddToVaultProps) {
@@ -157,76 +226,28 @@ export function AddLinkModal({ onClose, onSave, collections, onAddCollection, la
   const [urlError, setUrlError]         = useState("");
   const [preview, setPreview]           = useState<LinkPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [pasteStatus, setPasteStatus]   = useState<"idle" | "success" | "failed" | "hint">("idle");
 
   const debounceRef        = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const titleAutoFilledRef = useRef(false);
-  const urlInputRef        = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     const trimmed = url.trim();
     if (!trimmed || !isValidUrl(trimmed)) { setPreview(null); setPreviewLoading(false); return; }
     setPreviewLoading(true);
+    let cancelled = false;
     debounceRef.current = setTimeout(async () => {
-      try {
-        const normalized = trimmed.startsWith("http") ? trimmed : `https://${trimmed}`;
-        const res  = await fetch(`https://api.microlink.io?url=${encodeURIComponent(normalized)}`);
-        const data = await res.json();
-        if (data.status === "success") {
-          const p: LinkPreview = {
-            title: data.data.title ?? undefined,
-            description: data.data.description ?? undefined,
-            image: data.data.image?.url ?? undefined,
-            logo:  data.data.logo?.url ?? undefined,
-          };
-          setPreview(p);
-          if (p.title && !titleAutoFilledRef.current && !title) {
-            setTitle(p.title);
-            titleAutoFilledRef.current = true;
-          }
-        } else { setPreview(null); }
-      } catch { setPreview(null); }
-      finally  { setPreviewLoading(false); }
-    }, 700);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+      const normalized = trimmed.startsWith("http") ? trimmed : `https://${trimmed}`;
+      const p = await fetchPreview(normalized);
+      if (cancelled) return;
+      setPreview(p);
+      setPreviewLoading(false);
+    }, 500);
+    return () => { cancelled = true; if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [url]);
 
   const handleUrlChange = (val: string) => {
     setUrl(val);
     if (urlError) setUrlError("");
-    titleAutoFilledRef.current = false;
-  };
-
-  const handleAutoPaste = async () => {
-    // Always focus the URL input first (needed for execCommand + long-press UX)
-    urlInputRef.current?.focus();
-
-    // 1. Standard Clipboard API
-    const text = await readClipboard();
-    if (text.trim()) {
-      handleUrlChange(text.trim());
-      setPasteStatus("success");
-      setTimeout(() => setPasteStatus("idle"), 2500);
-      return;
-    }
-
-    // 2. execCommand directly on focused input (some WebViews)
-    try {
-      document.execCommand("paste");
-      await new Promise((r) => setTimeout(r, 80));
-      const val = urlInputRef.current?.value ?? "";
-      if (val.trim()) {
-        handleUrlChange(val.trim());
-        setPasteStatus("success");
-        setTimeout(() => setPasteStatus("idle"), 2500);
-        return;
-      }
-    } catch { /* not supported */ }
-
-    // 3. Nothing worked — input is already focused, user just long-presses now
-    setPasteStatus("hint");
-    setTimeout(() => setPasteStatus("idle"), 6000);
   };
 
   // Reminders no longer need Notification permission — uses in-app toast system
@@ -280,7 +301,6 @@ export function AddLinkModal({ onClose, onSave, collections, onAddCollection, la
               <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
             </svg>
             <input
-              ref={urlInputRef}
               className="flex-1 bg-transparent outline-none font-['Poppins:Regular',sans-serif] text-[#e8e8f5] text-[13px] placeholder:text-[#3a3a50] min-w-0"
               placeholder={t.urlPlaceholder}
               value={url}
@@ -294,32 +314,8 @@ export function AddLinkModal({ onClose, onSave, collections, onAddCollection, la
                 if (pasted.trim()) { e.preventDefault(); handleUrlChange(pasted.trim()); }
               }}
             />
-            <button
-              type="button"
-              onClick={handleAutoPaste}
-              className={`ml-2 flex-shrink-0 px-3 py-1.5 rounded-[8px] font-['Poppins:Medium',sans-serif] text-white text-[12px] transition-all ${
-                pasteStatus === "success" ? "bg-emerald-500" :
-                pasteStatus === "failed"  ? "bg-red-500/80" :
-                pasteStatus === "hint"    ? "bg-amber-500/80" :
-                "bg-[#9b59ff] active:opacity-80"
-              }`}
-            >
-              {pasteStatus === "success" ? t.pasted :
-               pasteStatus === "failed"  ? t.pasteFailed :
-               pasteStatus === "hint"    ? "..." :
-               t.autoPaste}
-            </button>
           </div>
           {urlError && <p className="font-['Poppins:Regular',sans-serif] text-red-400 text-[11px]">{urlError}</p>}
-          {pasteStatus === "hint" && (
-            <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 rounded-[10px] px-3 py-2">
-              <svg className="size-3.5 text-amber-400 flex-shrink-0" fill="none" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" />
-                <path d="M12 8v4M12 16h.01" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
-              </svg>
-              <p className="font-['Poppins:Regular',sans-serif] text-amber-400 text-[11px]">{t.pasteHint}</p>
-            </div>
-          )}
           {previewLoading && <PreviewSkeleton />}
           {!previewLoading && preview && <LinkPreviewCard preview={preview} url={url} />}
         </div>
