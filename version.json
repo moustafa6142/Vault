@@ -1,6 +1,6 @@
 {
-  "latestVersion": "1.1.0",
+  "latestVersion": "1.0.0",
   "apkDownloadUrl": "https://example.com/test.apk",
-  "releaseNotes": "Test update..",
+  "releaseNotes": "Initial release.",
   "forceUpdate": false
 }
